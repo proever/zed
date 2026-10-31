@@ -24,6 +24,8 @@ Terminals can open in two locations:
 - **Terminal Panel** — Docked at the bottom (default), left, or right of the workspace. Toggle with `` Ctrl+` ``.
 - **Center Pane** — Opens as a regular tab alongside your files. Use {#action workspace::NewCenterTerminal} from the command palette.
 
+To move an existing terminal between these locations, run {#action terminal::MoveToCenter} to move the active Terminal Panel terminal into the center pane, or {#action terminal::MoveToPanel} to move the active center terminal into the Terminal Panel. The terminal keeps its running shell and scrollback. You can also drag a terminal tab between the Terminal Panel and the center pane.
+
 ## Working with Multiple Terminals
 
 Create additional terminals with `Cmd+N` (macOS) or `Ctrl+N` (Linux/Windows) while focused in the terminal panel. Each terminal appears as a tab in the panel.
