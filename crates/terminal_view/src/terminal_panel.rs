@@ -443,10 +443,17 @@ impl TerminalPanel {
                         pane.set_zoomed(false, cx);
                     });
                     cx.emit(PanelEvent::Close);
-                } else if let Some(focus_on_pane) =
-                    focus_on_pane.as_ref().or_else(|| self.center.panes().pop())
-                {
-                    focus_on_pane.focus_handle(cx).focus(window, cx);
+                } else {
+                    // Focus can move outside of the panel, e.g. when the pane's last terminal was
+                    // moved to the center, so no remaining pane would get focused and become active.
+                    if &self.active_pane == pane {
+                        self.active_pane = self.center.last_pane();
+                    }
+                    if let Some(focus_on_pane) =
+                        focus_on_pane.as_ref().or_else(|| self.center.panes().pop())
+                    {
+                        focus_on_pane.focus_handle(cx).focus(window, cx);
+                    }
                 }
             }
             pane::Event::ZoomIn => {
