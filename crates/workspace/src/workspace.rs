@@ -7853,7 +7853,16 @@ impl Workspace {
         self.panes.retain(|p| p != pane);
         if let Some(focus_on) = focus_on {
             if removing_active_pane {
-                self.set_active_pane(focus_on, window, cx);
+                // `focus_on` can be a dock pane, e.g. when the removed pane's last item was
+                // moved into the terminal panel, and only center panes may be the active pane.
+                let next_active_pane = if self.panes.contains(focus_on) {
+                    Some(focus_on.clone())
+                } else {
+                    self.panes.last().cloned()
+                };
+                if let Some(next_active_pane) = next_active_pane {
+                    self.set_active_pane(&next_active_pane, window, cx);
+                }
             }
             focus_on.update(cx, |pane, cx| window.focus(&pane.focus_handle(cx), cx));
         } else if removing_active_pane {
@@ -15813,6 +15822,64 @@ mod tests {
         workspace.update(cx, |workspace, _cx| {
             let active_pane = workspace.active_pane();
             assert_eq!(top_pane_id, active_pane.entity_id());
+        });
+    }
+
+    #[gpui::test]
+    async fn test_moving_last_item_of_split_into_dock_pane_keeps_center_pane_active(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, None, cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+
+        add_an_item_to_active_pane(cx, &workspace, 1);
+        let left_pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+        let right_pane = split_pane(cx, &workspace);
+        let moved_item = add_an_item_to_active_pane(cx, &workspace, 2);
+        let dock_pane = workspace.update_in(cx, |workspace, window, cx| {
+            let workspace = workspace.weak_handle();
+            cx.new(|cx| {
+                Pane::new(
+                    workspace,
+                    project.clone(),
+                    Default::default(),
+                    None,
+                    NewFile.boxed_clone(),
+                    false,
+                    window,
+                    cx,
+                )
+            })
+        });
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, _| {
+            assert_eq!(workspace.active_pane(), &right_pane);
+        });
+
+        workspace.update_in(cx, |_, window, cx| {
+            move_item(
+                &right_pane,
+                &dock_pane,
+                moved_item.item_id(),
+                0,
+                true,
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        workspace.read_with(cx, |workspace, cx| {
+            assert_eq!(workspace.panes(), [left_pane.clone()]);
+            assert_eq!(
+                workspace.active_pane(),
+                &left_pane,
+                "a pane outside the center must not become the active pane"
+            );
+            assert_eq!(dock_pane.read(cx).items_len(), 1);
         });
     }
 
