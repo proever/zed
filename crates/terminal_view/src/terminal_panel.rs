@@ -34,7 +34,7 @@ use workspace::{
     SwapPaneLeft, SwapPaneRight, SwapPaneUp, ToggleZoom, Workspace,
     dock::{DockPosition, Panel, PanelEvent, PanelHandle},
     item::SerializableItem,
-    move_active_item, pane,
+    move_active_item, move_item, pane,
 };
 
 use anyhow::{Result, anyhow};
@@ -49,6 +49,18 @@ actions!(
         Toggle,
         /// Toggles focus on the terminal panel.
         ToggleFocus
+    ]
+);
+
+actions!(
+    terminal,
+    [
+        /// Moves the active terminal of the terminal panel into the active center pane,
+        /// keeping its shell session running.
+        MoveToCenter,
+        /// Moves the active terminal of the center pane into the terminal panel,
+        /// keeping its shell session running.
+        MoveToPanel,
     ]
 );
 
@@ -68,6 +80,20 @@ pub fn init(cx: &mut App) {
                         workspace.close_panel::<TerminalPanel>(window, cx);
                     }
                 }
+            });
+            workspace.register_action_renderer(|div, workspace, _, cx| {
+                let Some(terminal_panel) = workspace.panel::<TerminalPanel>(cx) else {
+                    return div;
+                };
+                let can_move_to_center =
+                    active_terminal_view(&terminal_panel.read(cx).active_pane, cx).is_some();
+                let can_move_to_panel = active_terminal_view(workspace.active_pane(), cx).is_some();
+                div.when(can_move_to_center, |div| {
+                    div.on_action(cx.listener(TerminalPanel::move_terminal_to_center))
+                })
+                .when(can_move_to_panel, |div| {
+                    div.on_action(cx.listener(TerminalPanel::move_terminal_to_panel))
+                })
             });
         },
     )
@@ -784,6 +810,59 @@ impl TerminalPanel {
             .detach_and_log_err(cx);
     }
 
+    fn move_terminal_to_center(
+        workspace: &mut Workspace,
+        _: &MoveToCenter,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) {
+        let Some(terminal_panel) = workspace.panel::<Self>(cx) else {
+            return;
+        };
+        let terminal_pane = terminal_panel.read(cx).active_pane.clone();
+        let Some(terminal_view) = active_terminal_view(&terminal_pane, cx) else {
+            return;
+        };
+        let center_pane = workspace.active_pane().clone();
+        move_item(
+            &terminal_pane,
+            &center_pane,
+            terminal_view.entity_id(),
+            center_pane.read(cx).items_len(),
+            true,
+            window,
+            cx,
+        );
+    }
+
+    fn move_terminal_to_panel(
+        workspace: &mut Workspace,
+        _: &MoveToPanel,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) {
+        let Some(terminal_panel) = workspace.panel::<Self>(cx) else {
+            return;
+        };
+        let center_pane = workspace.active_pane().clone();
+        let Some(terminal_view) = active_terminal_view(&center_pane, cx) else {
+            return;
+        };
+        let terminal_pane = terminal_panel.read(cx).active_pane.clone();
+        move_item(
+            &center_pane,
+            &terminal_pane,
+            terminal_view.entity_id(),
+            terminal_pane.read(cx).items_len(),
+            true,
+            window,
+            cx,
+        );
+        // Revealing an empty terminal panel spawns a new shell, so the panel must only be
+        // opened once the moved terminal is in it.
+        workspace.focus_panel::<Self>(window, cx);
+    }
+
     fn terminals_for_task(
         &self,
         label: &str,
@@ -1309,6 +1388,10 @@ pub fn prepare_task_for_spawn(
 
 fn is_enabled_in_workspace(workspace: &Workspace, cx: &App) -> bool {
     workspace.project().read(cx).supports_terminal(cx)
+}
+
+fn active_terminal_view(pane: &Entity<Pane>, cx: &App) -> Option<Entity<TerminalView>> {
+    pane.read(cx).active_item()?.downcast::<TerminalView>()
 }
 
 pub fn new_terminal_pane(
@@ -1885,7 +1968,7 @@ mod tests {
 
     use super::*;
     use crate::persistence::{SerializedPane, SerializedPaneGroup};
-    use gpui::{Modifiers, TestAppContext, UpdateGlobal as _, VisualTestContext};
+    use gpui::{EntityId, Modifiers, TestAppContext, UpdateGlobal as _, VisualTestContext};
     use pretty_assertions::assert_eq;
     use project::FakeFs;
     use settings::SettingsStore;
@@ -3355,6 +3438,277 @@ mod tests {
             center_items_after, center_items_before,
             "Center pane should not gain a new terminal when panel is focused"
         );
+    }
+
+    async fn spawn_panel_terminal(
+        terminal_panel: &Entity<TerminalPanel>,
+        cx: &mut VisualTestContext,
+    ) -> Entity<TerminalView> {
+        terminal_panel
+            .update_in(cx, |terminal_panel, window, cx| {
+                terminal_panel.add_terminal_shell(false, None, RevealStrategy::Always, window, cx)
+            })
+            .await
+            .expect("Failed to spawn a panel terminal");
+        cx.run_until_parked();
+        terminal_panel.read_with(cx, |terminal_panel, cx| {
+            terminal_panel
+                .active_pane
+                .read(cx)
+                .active_item()
+                .and_then(|item| item.downcast::<TerminalView>())
+                .expect("the new terminal should be the active panel item")
+        })
+    }
+
+    fn live_terminal_ids(
+        workspace: &Entity<Workspace>,
+        cx: &mut VisualTestContext,
+    ) -> Vec<EntityId> {
+        workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .project()
+                .read(cx)
+                .local_terminal_handles()
+                .iter()
+                .map(|terminal| terminal.entity_id())
+                .collect()
+        })
+    }
+
+    #[gpui::test]
+    async fn test_move_terminal_to_center_and_back_keeps_session(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        init_test(cx);
+
+        let (window_handle, terminal_panel) = init_workspace_with_panel(cx).await;
+        let workspace = window_handle
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .expect("Failed to read workspace");
+        let cx = &mut VisualTestContext::from_window(window_handle.into(), cx);
+
+        cx.update(|window, cx| {
+            assert!(
+                !window.is_action_available(&MoveToCenter, cx),
+                "there is no panel terminal to move yet"
+            );
+            assert!(
+                !window.is_action_available(&MoveToPanel, cx),
+                "there is no center terminal to move"
+            );
+        });
+
+        let terminal_view = spawn_panel_terminal(&terminal_panel, cx).await;
+        let terminal =
+            terminal_view.read_with(cx, |terminal_view, _| terminal_view.terminal().clone());
+        assert_eq!(live_terminal_ids(&workspace, cx), [terminal.entity_id()]);
+        cx.update(|window, cx| {
+            assert!(window.is_action_available(&MoveToCenter, cx));
+            assert!(!window.is_action_available(&MoveToPanel, cx));
+        });
+
+        cx.dispatch_action(MoveToCenter);
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            let center_terminal = workspace
+                .active_pane()
+                .read(cx)
+                .active_item()
+                .and_then(|item| item.downcast::<TerminalView>());
+            assert_eq!(
+                center_terminal.as_ref(),
+                Some(&terminal_view),
+                "the panel terminal itself should become the active center item"
+            );
+            assert_eq!(terminal_view.read(cx).terminal(), &terminal);
+            assert!(
+                terminal_view.focus_handle(cx).contains_focused(window, cx),
+                "the moved terminal should be focused"
+            );
+            let dock_position = terminal_panel.read(cx).position(window, cx);
+            assert!(
+                !workspace.is_dock_at_position_open(dock_position, cx),
+                "the emptied terminal panel should close"
+            );
+        });
+        terminal_panel.read_with(cx, |terminal_panel, cx| {
+            assert_eq!(terminal_panel.active_pane.read(cx).items_len(), 0);
+        });
+        assert_eq!(
+            live_terminal_ids(&workspace, cx),
+            [terminal.entity_id()],
+            "moving a terminal must neither restart nor spawn a shell"
+        );
+        cx.update(|window, cx| {
+            assert!(!window.is_action_available(&MoveToCenter, cx));
+            assert!(window.is_action_available(&MoveToPanel, cx));
+        });
+
+        cx.dispatch_action(MoveToPanel);
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            assert_eq!(workspace.active_pane().read(cx).items_len(), 0);
+            assert_eq!(terminal_view.read(cx).terminal(), &terminal);
+            assert!(
+                terminal_view.focus_handle(cx).contains_focused(window, cx),
+                "the terminal moved back into the panel should be focused"
+            );
+            let dock_position = terminal_panel.read(cx).position(window, cx);
+            assert!(
+                workspace.is_dock_at_position_open(dock_position, cx),
+                "the terminal panel should open"
+            );
+        });
+        terminal_panel.read_with(cx, |terminal_panel, cx| {
+            let panel_items = terminal_panel
+                .active_pane
+                .read(cx)
+                .items()
+                .map(|item| item.item_id())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                panel_items,
+                [terminal_view.entity_id()],
+                "opening the panel for the moved terminal must not spawn a default terminal"
+            );
+        });
+        assert_eq!(live_terminal_ids(&workspace, cx), [terminal.entity_id()]);
+    }
+
+    #[gpui::test]
+    async fn test_move_terminal_to_center_from_split_terminal_panel(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        init_test(cx);
+
+        let (window_handle, terminal_panel) = init_workspace_with_panel(cx).await;
+        let workspace = window_handle
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .expect("Failed to read workspace");
+        let cx = &mut VisualTestContext::from_window(window_handle.into(), cx);
+
+        let remaining_terminal = spawn_panel_terminal(&terminal_panel, cx).await;
+        let moved_terminal = spawn_panel_terminal(&terminal_panel, cx).await;
+        let remaining_pane =
+            terminal_panel.read_with(cx, |terminal_panel, _| terminal_panel.active_pane.clone());
+        remaining_pane.update_in(cx, |pane, window, cx| {
+            pane.split(SplitDirection::Right, SplitMode::MovePane, window, cx)
+        });
+        cx.run_until_parked();
+        terminal_panel.read_with(cx, |terminal_panel, cx| {
+            assert_eq!(terminal_panel.center.panes().len(), 2);
+            assert_ne!(terminal_panel.active_pane, remaining_pane);
+            assert_eq!(
+                terminal_panel
+                    .active_pane
+                    .read(cx)
+                    .active_item()
+                    .map(|item| item.item_id()),
+                Some(moved_terminal.entity_id())
+            );
+        });
+
+        cx.dispatch_action(MoveToCenter);
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            assert_eq!(
+                workspace
+                    .active_pane()
+                    .read(cx)
+                    .active_item()
+                    .map(|item| item.item_id()),
+                Some(moved_terminal.entity_id())
+            );
+            assert!(moved_terminal.focus_handle(cx).contains_focused(window, cx));
+            let dock_position = terminal_panel.read(cx).position(window, cx);
+            assert!(
+                workspace.is_dock_at_position_open(dock_position, cx),
+                "the terminal panel still has a terminal, so it should stay open"
+            );
+        });
+        terminal_panel.read_with(cx, |terminal_panel, _| {
+            assert_eq!(
+                terminal_panel.center.panes(),
+                [&remaining_pane],
+                "the emptied split should be removed"
+            );
+            assert_eq!(
+                terminal_panel.active_pane, remaining_pane,
+                "the remaining pane should become the active one"
+            );
+        });
+
+        cx.dispatch_action(MoveToPanel);
+
+        remaining_pane.read_with(cx, |pane, _| {
+            let items = pane.items().map(|item| item.item_id()).collect::<Vec<_>>();
+            assert_eq!(
+                items,
+                [remaining_terminal.entity_id(), moved_terminal.entity_id()],
+                "the terminal should move back into the visible terminal panel pane"
+            );
+        });
+        workspace.update_in(cx, |_, window, cx| {
+            assert!(moved_terminal.focus_handle(cx).contains_focused(window, cx));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_move_terminal_to_panel_from_split_center_keeps_center_pane_active(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        init_test(cx);
+
+        let (window_handle, terminal_panel) = init_workspace_with_panel(cx).await;
+        let workspace = window_handle
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .expect("Failed to read workspace");
+        let cx = &mut VisualTestContext::from_window(window_handle.into(), cx);
+
+        open_center_display_terminal(&workspace, cx).await;
+        open_center_display_terminal(&workspace, cx).await;
+        let remaining_pane =
+            workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+        remaining_pane.update_in(cx, |pane, window, cx| {
+            pane.split(SplitDirection::Right, SplitMode::MovePane, window, cx)
+        });
+        cx.run_until_parked();
+        let moved_terminal = workspace.read_with(cx, |workspace, cx| {
+            assert_eq!(workspace.panes().len(), 2);
+            assert_ne!(workspace.active_pane(), &remaining_pane);
+            workspace
+                .active_pane()
+                .read(cx)
+                .active_item()
+                .and_then(|item| item.downcast::<TerminalView>())
+                .expect("the split pane should hold the moved center terminal")
+        });
+
+        cx.dispatch_action(MoveToPanel);
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            assert_eq!(
+                workspace.panes(),
+                [remaining_pane.clone()],
+                "the emptied split should be removed"
+            );
+            assert_eq!(
+                workspace.active_pane(),
+                &remaining_pane,
+                "a terminal panel pane must not become the active center pane"
+            );
+            assert!(moved_terminal.focus_handle(cx).contains_focused(window, cx));
+        });
+        terminal_panel.read_with(cx, |terminal_panel, cx| {
+            assert_eq!(
+                terminal_panel
+                    .active_pane
+                    .read(cx)
+                    .active_item()
+                    .map(|item| item.item_id()),
+                Some(moved_terminal.entity_id())
+            );
+        });
     }
 
     fn set_max_tabs(cx: &mut TestAppContext, value: Option<usize>) {
