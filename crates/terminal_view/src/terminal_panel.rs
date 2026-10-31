@@ -3689,7 +3689,7 @@ mod tests {
         workspace.update_in(cx, |workspace, window, cx| {
             assert_eq!(
                 workspace.panes(),
-                [remaining_pane.clone()],
+                std::slice::from_ref(&remaining_pane),
                 "the emptied split should be removed"
             );
             assert_eq!(

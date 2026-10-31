@@ -15873,7 +15873,7 @@ mod tests {
         cx.run_until_parked();
 
         workspace.read_with(cx, |workspace, cx| {
-            assert_eq!(workspace.panes(), [left_pane.clone()]);
+            assert_eq!(workspace.panes(), std::slice::from_ref(&left_pane));
             assert_eq!(
                 workspace.active_pane(),
                 &left_pane,
